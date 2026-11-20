@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DBFinder v1.0 — find a forgotten MySQL database name and location.
+"""DBFinder v1.0.1 — find a forgotten MySQL database name and location.
 
 Run this on the PC that hosts the database. It is READ-ONLY: it never
 modifies, deletes, or writes into any database folder. The only file it
@@ -7,8 +7,9 @@ ever writes is the report you explicitly export.
 
 What it does:
   1. Lists MySQL / MariaDB Windows services (name, state, ImagePath).
-  2. Finds mysqld.exe / mysql.exe, my.ini / my.cnf files, and reads the
-     datadir / port out of them.
+  2. Finds mysqld.exe / mysql.exe — including renamed variants such as
+     vlmysqld.exe — and my.ini / my.cnf files, including ones a service
+     points at with --defaults-file, and reads datadir / port from them.
   3. Lists every database folder inside each datadir, with size, file
      counts (.frm / .ibd / .myd / .myi) and last-modified date.
   4. "Connection String Hunter": scans .config / .ini / .cs / .vb and
@@ -25,8 +26,8 @@ Usage:
   CLI + report file: py dbfinder.py --scan --report report.txt
   CLI + hunt a folder: py dbfinder.py --scan --hunt "C:\\Users\\Me\\Documents"
 
-Stdlib only — no pip dependencies. No network access except a localhost
-check on port 3306. No multiprocessing.
+Stdlib only — no pip dependencies. No network access except localhost
+port checks (3306, plus any port a my.ini names). No multiprocessing.
 """
 
 import argparse
@@ -44,7 +45,7 @@ import sys
 import threading
 
 APP_NAME = "DBFinder"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -179,7 +180,8 @@ def parse_my_ini(path):
     "basedir":...|None}. Only the [mysqld] section is read — a datadir
     anywhere else would be misleading. Never raises.
     """
-    result = {"path": path, "datadir": None, "port": None, "basedir": None}
+    result = {"path": path, "datadir": None, "port": None, "basedir": None,
+              "source": None, "service": None}
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as fh:
             in_mysqld = False
@@ -207,6 +209,46 @@ def parse_my_ini(path):
     return result
 
 
+# A service ImagePath may carry its config file explicitly, e.g.
+#   "C:\...\vlmysqld" --defaults-file="C:\...\my.ini" IVMS320MYSQL
+# Bundled installs (PVMS, camera software, ...) keep everything under
+# their own folder, so this is often the ONLY pointer to their my.ini.
+_DEFAULTS_FILE_RE = re.compile(
+    r'--defaults-file\s*=\s*(?:"([^"]+)"|(\S+))', re.IGNORECASE)
+
+
+def extract_defaults_file(image_path):
+    """Pull the --defaults-file path out of a service ImagePath.
+
+    Handles the quoted form (--defaults-file="C:\\...\\my.ini") and
+    the unquoted form (--defaults-file=C:\\...\\my.ini). Returns ""
+    when the ImagePath carries no --defaults-file.
+    """
+    if not image_path:
+        return ""
+    m = _DEFAULTS_FILE_RE.search(image_path)
+    if not m:
+        return ""
+    return (m.group(1) or m.group(2) or "").strip()
+
+
+def binary_from_image_path(image_path):
+    """First token of a service ImagePath — the exe the service runs.
+
+    Handles the quoted form ("C:\\Program Files\\...\\vlmysqld"
+    --defaults-file=...) and the bare form. The returned path may
+    lack its .exe suffix (Windows resolves it); see _resolve_exe.
+    """
+    if not image_path:
+        return ""
+    text = image_path.strip()
+    if text.startswith('"'):
+        end = text.find('"', 1)
+        if end > 0:
+            return text[1:end]
+    return text.split(None, 1)[0].strip('"')
+
+
 def _ini_search_roots(extra_roots=None):
     """Directories that may hold a my.ini / my.cnf (Windows layout)."""
     roots = [
@@ -225,11 +267,15 @@ def _ini_search_roots(extra_roots=None):
     return roots
 
 
-def find_my_ini_files(extra_roots=None):
+def find_my_ini_files(extra_roots=None, services=None):
     """Find my.ini / my.cnf files and parse each one.
 
     Returns a list of parse_my_ini() dicts, de-duplicated by path.
     `extra_roots` lets tests point the search at a fake layout.
+    `services` (MySQL service dicts) lets a service's --defaults-file
+    point at a my.ini in a non-standard location — those entries carry
+    a "source" label ("from service NAME --defaults-file") and the
+    service name, so the user can see where they came from.
     """
     found = {}
     for root in _ini_search_roots(extra_roots):
@@ -248,6 +294,26 @@ def find_my_ini_files(extra_roots=None):
             key = os.path.normcase(os.path.abspath(path))
             if key not in found:
                 found[key] = parse_my_ini(path)
+    # Services may point at a my.ini anywhere on disk via
+    # --defaults-file="...". Those are often the ONLY copy — a bundled
+    # install (e.g. PVMS) keeps everything under its own folder.
+    # The entry is kept even if the file is missing, so the user can
+    # see where the service claims its config lives.
+    for svc in (services or []):
+        ini_path = extract_defaults_file(svc.get("image_path", ""))
+        if not ini_path:
+            continue
+        key = os.path.normcase(os.path.abspath(ini_path))
+        source = "from service %s --defaults-file" % svc.get("name", "?")
+        if key in found:
+            # Same file found both ways: keep the richer source label.
+            found[key]["source"] = source
+            found[key]["service"] = svc.get("name", "")
+        else:
+            parsed = parse_my_ini(ini_path)
+            parsed["source"] = source
+            parsed["service"] = svc.get("name", "")
+            found[key] = parsed
     return sorted(found.values(), key=lambda d: d["path"])
 
 
@@ -439,30 +505,80 @@ def find_sqlserver_services():
 # Binaries, host info, port check, SQL Server files
 # ---------------------------------------------------------------------------
 
-def find_mysql_binaries():
-    """Find mysqld.exe / mysql.exe via PATH and common install dirs."""
+# Known MySQL bin dirs (glob patterns — one * per install folder).
+_BIN_DIR_PATTERNS = [
+    os.path.join(_program_files(), "MySQL", "*", "bin"),
+    os.path.join(_program_files_x86(), "MySQL", "*", "bin"),
+    os.path.join(_program_data(), "MySQL", "*", "bin"),
+    r"C:\MySQL\bin",
+    r"C:\xampp\mysql\bin",
+    r"C:\wamp*\bin\mysql\*\bin",
+    r"C:\wamp*\bin\mariadb\*\bin",
+]
+
+
+def _is_mysql_server_binary(path):
+    """True for mysqld.exe and renamed variants (vlmysqld.exe, ...)."""
+    name = os.path.basename(path).lower()
+    return "mysqld" in name or name in ("mariadbd.exe", "mariadbd")
+
+
+def _is_mysql_client_binary(path):
+    """True for mysql.exe and renamed clients (name has mysql, .exe)."""
+    name = os.path.basename(path).lower()
+    return name.endswith(".exe") and "mysql" in name
+
+
+def _resolve_exe(path):
+    """Return `path` if it is a file, else `path` + ".exe" if that is.
+
+    Service ImagePaths often name the binary without its .exe suffix.
+    """
+    if not path:
+        return ""
+    if os.path.isfile(path):
+        return path
+    if not path.lower().endswith(".exe") and os.path.isfile(path + ".exe"):
+        return path + ".exe"
+    return ""
+
+
+def _scan_bin_dir(bindir, found):
+    """Add every MySQL server/client binary in one bin dir to `found`."""
+    if not bindir or not os.path.isdir(bindir):
+        return
+    try:
+        names = os.listdir(bindir)
+    except OSError:
+        return
+    for name in names:
+        full = os.path.join(bindir, name)
+        if _is_mysql_server_binary(full) or _is_mysql_client_binary(full):
+            found[os.path.normcase(os.path.abspath(full))] = full
+
+
+def find_mysql_binaries(extra_paths=None, extra_bin_dirs=None):
+    """Find MySQL server/client binaries, including renamed variants.
+
+    Searches PATH plus the known bin dirs, and any extra exe paths /
+    bin dirs passed in (run_scan passes the ones from service
+    ImagePaths). A binary counts if its name contains "mysqld"
+    (vlmysqld.exe, ...) or contains "mysql" and ends in .exe.
+    """
     found = {}
     for exe in ("mysqld", "mysql", "mariadbd"):
         path = shutil.which(exe + (".exe" if IS_WINDOWS else ""))
         if path:
             found[os.path.normcase(os.path.abspath(path))] = path
-    patterns = [
-        os.path.join(_program_files(), "MySQL", "*", "bin", "mysqld.exe"),
-        os.path.join(_program_files(), "MySQL", "*", "bin", "mysql.exe"),
-        os.path.join(_program_files_x86(), "MySQL", "*", "bin", "mysqld.exe"),
-        os.path.join(_program_files_x86(), "MySQL", "*", "bin", "mysql.exe"),
-        os.path.join(_program_data(), "MySQL", "*", "bin", "mysqld.exe"),
-        r"C:\MySQL\bin\mysqld.exe",
-        r"C:\MySQL\bin\mysql.exe",
-        r"C:\xampp\mysql\bin\mysqld.exe",
-        r"C:\xampp\mysql\bin\mysql.exe",
-        r"C:\wamp*\bin\mysql\*\bin\mysqld.exe",
-        r"C:\wamp*\bin\mysql\*\bin\mysql.exe",
-        r"C:\wamp*\bin\mariadb\*\bin\mariadbd.exe",
-    ]
-    for pattern in patterns:
-        for path in glob.glob(pattern):
-            found[os.path.normcase(os.path.abspath(path))] = path
+    for pattern in _BIN_DIR_PATTERNS:
+        for bindir in glob.glob(pattern):
+            _scan_bin_dir(bindir, found)
+    for path in (extra_paths or []):
+        resolved = _resolve_exe(path)
+        if resolved:
+            found[os.path.normcase(os.path.abspath(resolved))] = resolved
+    for bindir in (extra_bin_dirs or []):
+        _scan_bin_dir(bindir, found)
     return sorted(found.values())
 
 
@@ -488,13 +604,24 @@ def get_host_info():
     return {"hostname": hostname, "lan_ip": lan_ip}
 
 
-def check_port_3306(timeout=2):
-    """True if something answers on localhost:3306 (MySQL default)."""
+def check_port(port, timeout=2):
+    """True if something answers on localhost:`port`."""
     try:
-        with socket.create_connection(("127.0.0.1", 3306), timeout=timeout):
+        port = int(port)
+    except (TypeError, ValueError):
+        return False
+    if not 0 < port < 65536:
+        return False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
             return True
     except OSError:
         return False
+
+
+def check_port_3306(timeout=2):
+    """True if something answers on localhost:3306 (MySQL default)."""
+    return check_port(3306, timeout=timeout)
 
 
 def find_sqlserver_data_files():
@@ -699,22 +826,64 @@ def run_live_check(host, port, user, password, mysql_exe):
 # Full scan + report
 # ---------------------------------------------------------------------------
 
-def run_scan(hunt_folder=None, extra_myini_roots=None):
+def run_scan(hunt_folder=None, extra_myini_roots=None, services=None):
     """Run every read-only check and return one findings dict.
 
     `hunt_folder` (optional) is also scanned for connection strings.
     `extra_myini_roots` is for tests — it adds my.ini search roots.
+    `services`, when given, replaces the live service enumeration
+    (tests use it to inject a fake service).
     """
     host = get_host_info()
+    mysql_services = (services if services is not None
+                      else find_mysql_services())
+    # Service ImagePaths can reveal binaries and config files that live
+    # outside the standard folders (renamed mysqld, --defaults-file).
+    service_exe_paths = []
+    service_bin_dirs = []
+    for svc in mysql_services:
+        exe = binary_from_image_path(svc.get("image_path", ""))
+        if exe:
+            service_exe_paths.append(exe)
+            service_bin_dirs.append(os.path.dirname(exe))
+    ini_files = find_my_ini_files(extra_myini_roots, services=mysql_services)
+
+    # Port checks: always 3306, plus every port a my.ini names, each
+    # labelled with the service/instance it belongs to.
+    port_checks = []
+    seen_ports = set()
+    port_labels = [(3306, "")]
+    port_labels += [
+        (ini.get("port"), ini.get("service") or "my.ini")
+        for ini in ini_files if ini.get("port")
+    ]
+    for port, label in port_labels:
+        try:
+            port_int = int(str(port).strip())
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if port_int in seen_ports or not 0 < port_int < 65536:
+            continue
+        seen_ports.add(port_int)
+        port_checks.append({
+            "port": port_int,
+            "label": label,
+            "open": check_port(port_int),
+        })
+
     findings = {
         "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "hostname": host["hostname"],
         "lan_ip": host["lan_ip"],
-        "port_3306_open": check_port_3306(),
-        "mysql_services": find_mysql_services(),
+        "port_3306_open": any(pc["port"] == 3306 and pc["open"]
+                              for pc in port_checks),
+        "port_checks": port_checks,
+        "mysql_services": mysql_services,
         "sqlserver_services": find_sqlserver_services(),
-        "binaries": find_mysql_binaries(),
-        "ini_files": find_my_ini_files(extra_myini_roots),
+        "binaries": find_mysql_binaries(
+            extra_paths=service_exe_paths,
+            extra_bin_dirs=service_bin_dirs),
+        "ini_files": ini_files,
         "datadirs": [],
         "stray_db_folders": [],
         "sqlserver_files": find_sqlserver_data_files(),
@@ -771,7 +940,16 @@ def build_report(findings):
     add("")
 
     add("== MySQL server ==")
-    if findings.get("port_3306_open"):
+    port_checks = findings.get("port_checks")
+    if port_checks:
+        for pc in port_checks:
+            suffix = f" ({pc['label']})" if pc.get("label") else ""
+            if pc["open"]:
+                add(f"Port {pc['port']}{suffix}: LISTENING — a MySQL "
+                    f"server is answering on this port.")
+            else:
+                add(f"Port {pc['port']}{suffix}: not listening")
+    elif findings.get("port_3306_open"):
         add("Port 3306 (MySQL): LISTENING — a MySQL server is running.")
     else:
         add("Port 3306 (MySQL): not listening — no server on this PC, "
@@ -798,6 +976,8 @@ def build_report(findings):
     add("== my.ini / my.cnf files ==")
     for ini in findings.get("ini_files", []):
         add(f"  {ini['path']}")
+        if ini.get("source"):
+            add(f"      source: {ini['source']}")
         add(f"      datadir: {ini.get('datadir') or '-'}")
         add(f"      port:    {ini.get('port') or '-'}")
         add(f"      basedir: {ini.get('basedir') or '-'}")
@@ -887,6 +1067,12 @@ def cli_main(args):
 def _mysql_exe_from_binaries(binaries):
     for path in binaries:
         if os.path.basename(path).lower() == "mysql.exe":
+            return path
+    # Fall back to any renamed client (name has mysql, ends .exe)
+    # that is not a server binary.
+    for path in binaries:
+        if _is_mysql_client_binary(path) \
+                and not _is_mysql_server_binary(path):
             return path
     return ""
 

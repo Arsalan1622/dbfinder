@@ -189,5 +189,151 @@ class FakeLayoutTestCase(unittest.TestCase):
         self.assertNotIn(self.old_db, hits)  # .myd/.myi are not searched
 
 
+class ServiceDefaultsFileTestCase(unittest.TestCase):
+    """Mimics the real laptop miss: a PVMS-style bundled MySQL.
+
+    Service IVMS320MYSQL runs a renamed binary (vlmysqld) with
+    --defaults-file pointing at a my.ini outside the standard
+    locations, on port 34174. v1.0.0 found the service but none of
+    the rest; v1.0.1 must find it all.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = self.tmp.name
+        # Fake bundled install: <root>/PVMS 2020/Database/
+        self.db_home = os.path.join(root, "PVMS 2020", "Database")
+        self.bin_dir = os.path.join(self.db_home, "bin")
+        os.makedirs(self.bin_dir)
+        self.vlmysqld = os.path.join(self.bin_dir, "vlmysqld.exe")
+        _write(self.vlmysqld, "fake-binary")
+        # Fake datadir with two DBs.
+        self.datadir = os.path.join(self.db_home, "data")
+        self.surv_db = os.path.join(self.datadir, "surveillancesystem")
+        self.other_db = os.path.join(self.datadir, "configdb")
+        os.makedirs(self.surv_db)
+        os.makedirs(self.other_db)
+        for name in ("cameras", "events", "users"):
+            _write(os.path.join(self.surv_db, name + ".frm"), "fake")
+        for name in ("cameras", "events"):
+            _write(os.path.join(self.surv_db, name + ".ibd"), "fake-ibd")
+        _write(os.path.join(self.other_db, "settings.frm"), "fake")
+        _write(os.path.join(self.datadir, "ibdata1"), "fake-innodb")
+        # Fake my.ini: non-standard port, datadir, basedir.
+        self.ini_path = os.path.join(self.db_home, "my.ini")
+        _write(self.ini_path,
+               "[mysqld]\n"
+               "port=34174\n"
+               f"basedir={self.db_home}\n"
+               f"datadir={self.datadir}\n")
+        # Fake service ImagePath, mirroring the real laptop one
+        # (binary path has NO .exe suffix, like the real service).
+        self.image_path = (
+            f'"{os.path.join(self.bin_dir, "vlmysqld")}" '
+            f'--defaults-file="{self.ini_path}" IVMS320MYSQL')
+        self.service = {
+            "name": "IVMS320MYSQL",
+            "display": "IVMS320MYSQL",
+            "state": "RUNNING",
+            "image_path": self.image_path,
+        }
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_version_is_1_0_1(self):
+        self.assertEqual(dbfinder.APP_VERSION, "1.0.1")
+
+    def test_extract_defaults_file_quoted(self):
+        self.assertEqual(
+            dbfinder.extract_defaults_file(self.image_path), self.ini_path)
+
+    def test_extract_defaults_file_unquoted(self):
+        image = ("C:\\Somewhere\\mysqld "
+                 "--defaults-file=C:\\Data\\my.ini MYSQL57")
+        self.assertEqual(dbfinder.extract_defaults_file(image),
+                         r"C:\Data\my.ini")
+
+    def test_extract_defaults_file_missing(self):
+        self.assertEqual(
+            dbfinder.extract_defaults_file(
+                '"C:\\MySQL\\bin\\mysqld.exe" MySQL'), "")
+        self.assertEqual(dbfinder.extract_defaults_file(""), "")
+        self.assertEqual(dbfinder.extract_defaults_file(None), "")
+
+    def test_binary_from_image_path(self):
+        self.assertEqual(
+            dbfinder.binary_from_image_path(self.image_path),
+            os.path.join(self.bin_dir, "vlmysqld"))
+        self.assertEqual(
+            dbfinder.binary_from_image_path(
+                "C:\\MySQL\\bin\\mysqld.exe --defaults-file=x MySQL"),
+            "C:\\MySQL\\bin\\mysqld.exe")
+
+    def test_service_defaults_file_ini_parsed(self):
+        found = dbfinder.find_my_ini_files(services=[self.service])
+        paths = [f["path"] for f in found]
+        self.assertIn(self.ini_path, paths)
+        hit = [f for f in found if f["path"] == self.ini_path][0]
+        self.assertEqual(hit["datadir"], self.datadir)
+        self.assertEqual(hit["port"], "34174")
+        self.assertEqual(hit["basedir"], self.db_home)
+        self.assertEqual(hit["service"], "IVMS320MYSQL")
+        self.assertIn("IVMS320MYSQL", hit["source"])
+        self.assertIn("--defaults-file", hit["source"])
+
+    def test_service_datadir_databases_listed(self):
+        found = dbfinder.find_my_ini_files(services=[self.service])
+        hit = [f for f in found if f["path"] == self.ini_path][0]
+        dbs = dbfinder.list_databases(hit["datadir"])
+        names = {d["name"] for d in dbs}
+        self.assertEqual(names, {"surveillancesystem", "configdb"})
+        surv = [d for d in dbs if d["name"] == "surveillancesystem"][0]
+        self.assertEqual(surv["counts"][".frm"], 3)
+        self.assertEqual(surv["counts"][".ibd"], 2)
+        self.assertEqual(surv["files"], 5)
+        self.assertFalse(surv["system"])
+
+    def test_vlmysqld_detected_as_binary(self):
+        # Direct path (no .exe suffix, like the real ImagePath).
+        found = dbfinder.find_mysql_binaries(
+            extra_paths=[os.path.join(self.bin_dir, "vlmysqld")])
+        self.assertIn(self.vlmysqld, found)
+        # Via the bin dir scan.
+        found2 = dbfinder.find_mysql_binaries(extra_bin_dirs=[self.bin_dir])
+        self.assertIn(self.vlmysqld, found2)
+        # Name rules.
+        self.assertTrue(dbfinder._is_mysql_server_binary("vlmysqld.exe"))
+        self.assertTrue(dbfinder._is_mysql_server_binary("mysqld.exe"))
+        self.assertTrue(dbfinder._is_mysql_client_binary("mysql.exe"))
+        self.assertFalse(dbfinder._is_mysql_server_binary("notepad.exe"))
+        self.assertFalse(dbfinder._is_mysql_client_binary("notepad.exe"))
+
+    def test_full_scan_finds_service_instance(self):
+        findings = dbfinder.run_scan(services=[self.service])
+        # The service my.ini is parsed...
+        inis = [i for i in findings["ini_files"]
+                if i["path"] == self.ini_path]
+        self.assertEqual(len(inis), 1)
+        self.assertEqual(inis[0]["port"], "34174")
+        # ...its datadir's databases are listed...
+        all_dbs = [db["name"] for dd in findings["datadirs"]
+                   for db in dd["databases"]]
+        self.assertIn("surveillancesystem", all_dbs)
+        # ...the renamed binary is found...
+        self.assertIn(self.vlmysqld, findings["binaries"])
+        # ...and port 34174 is checked alongside 3306.
+        ports = {pc["port"]: pc for pc in findings["port_checks"]}
+        self.assertIn(3306, ports)
+        self.assertIn(34174, ports)
+        self.assertEqual(ports[34174]["label"], "IVMS320MYSQL")
+        # The report shows where it all came from.
+        report = dbfinder.build_report(findings)
+        self.assertIn("surveillancesystem", report)
+        self.assertIn("from service IVMS320MYSQL --defaults-file", report)
+        self.assertIn("Port 34174 (IVMS320MYSQL)", report)
+        self.assertIn("Port 3306", report)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

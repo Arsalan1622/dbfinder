@@ -1,4 +1,4 @@
-# DBFinder v1.0 — Find a forgotten MySQL database
+# DBFinder v1.0.1 — Find a forgotten MySQL database
 
 You have a PC with your own software and a MySQL database, other computers
 reach it over the LAN, and after 2 years you have forgotten the database
@@ -12,8 +12,13 @@ export. Passwords are always masked (`***`) and never stored or saved.
 
 1. **MySQL / MariaDB services** — name, running state, and ImagePath.
 2. **mysqld.exe / mysql.exe** — in Program Files, ProgramData, XAMPP,
-   WAMP, `C:\MySQL`, and PATH.
-3. **my.ini / my.cnf** — reads the `datadir` and `port` from each one.
+   WAMP, `C:\MySQL`, and PATH. Renamed variants count too
+   (`vlmysqld.exe`, ...), including binaries named in a service's
+   ImagePath.
+3. **my.ini / my.cnf** — reads the `datadir` and `port` from each one,
+   including a `my.ini` a service points at with `--defaults-file`
+   (bundled installs such as PVMS keep their config outside the
+   standard locations).
 4. **Databases** — every folder inside each datadir, with size, file
    counts (`.frm` / `.ibd` / `.myd` / `.myi`), last-modified date, and
    USER vs SYSTEM marking. Also flags `ibdata1` / `ib_logfile*`.
@@ -27,7 +32,9 @@ export. Passwords are always masked (`***`) and never stored or saved.
    files, in case the "SQL" on the PC is actually SQL Server (common
    with VS2010 apps).
 
-It also shows the PC name, LAN IP, and whether port 3306 is listening.
+It also shows the PC name, LAN IP, and per-instance port checks: port
+3306 plus every port a `my.ini` names (e.g. `Port 34174 (IVMS320MYSQL):
+listening`).
 
 ## Run it (no build needed)
 
@@ -72,7 +79,10 @@ py -m unittest test_dbfinder.py -v
 The tests build a fake MySQL layout in a temp dir (fake datadir, fake
 `my.ini`, fake `app.config` with a password) and verify my.ini parsing,
 database listing with file counts, connection-string extraction, and
-password masking in the report.
+password masking in the report. A second fake layout mimics a bundled
+PVMS-style install (service `IVMS320MYSQL`, renamed `vlmysqld.exe`,
+`--defaults-file`, port 34174) and verifies the service config is
+followed end to end.
 
 ## Files
 
