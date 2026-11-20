@@ -1,0 +1,30 @@
+# Build the Windows .exe in the cloud — no laptop setup needed.
+# Push this repo to GitHub and the exes appear under Actions > Artifacts.
+name: Build Windows exe
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run unit tests
+        run: python -m unittest test_dbfinder.py -v
+      - name: Build exes with PyInstaller
+        run: |
+          pip install pyinstaller
+          pyinstaller --onefile --console --clean --name DBFinder-console dbfinder.py
+          pyinstaller --onefile --windowed --clean --name DBFinder dbfinder.py
+      - name: Upload exes
+        uses: actions/upload-artifact@v4
+        with:
+          name: DBFinder-Windows
+          path: dist/
+          if-no-files-found: error
